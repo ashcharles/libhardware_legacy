@@ -1,5 +1,6 @@
 /*
  * Copyright 2008, The Android Open Source Project
+ * Copyright (C) 2012 Freescale Semiconductor, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -74,13 +75,13 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #define WIFI_TEST_INTERFACE		"sta"
 
 #ifndef WIFI_DRIVER_FW_PATH_STA
-#define WIFI_DRIVER_FW_PATH_STA		NULL
+#define WIFI_DRIVER_FW_PATH_STA		"sta"
 #endif
 #ifndef WIFI_DRIVER_FW_PATH_AP
-#define WIFI_DRIVER_FW_PATH_AP		NULL
+#define WIFI_DRIVER_FW_PATH_AP		"ap"
 #endif
 #ifndef WIFI_DRIVER_FW_PATH_P2P
-#define WIFI_DRIVER_FW_PATH_P2P		NULL
+#define WIFI_DRIVER_FW_PATH_P2P		"p2p"
 #endif
 
 #ifndef WIFI_DRIVER_FW_PATH_PARAM
@@ -89,12 +90,20 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
 
+static const char DRIVER_SDIO_IF_MODULE_NAME[]  = WIFI_SDIO_IF_DRIVER_MODULE_NAME;
+static const char DRIVER_SDIO_IF_MODULE_PATH[]  = WIFI_SDIO_IF_DRIVER_MODULE_PATH;
+static const char DRIVER_SDIO_IF_MODULE_ARG[]   = WIFI_SDIO_IF_DRIVER_MODULE_ARG;
+static const char DRIVER_COMPAT_MODULE_NAME[]   = WIFI_COMPAT_MODULE_NAME;
+static const char DRIVER_COMPAT_MODULE_PATH[]   = WIFI_COMPAT_MODULE_PATH;
+static const char DRIVER_COMPAT_MODULE_ARG[]    = WIFI_COMPAT_MODULE_ARG;
+
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
 #ifdef WIFI_DRIVER_MODULE_PATH
-static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
-static const char DRIVER_MODULE_TAG[]   = WIFI_DRIVER_MODULE_NAME " ";
-static const char DRIVER_MODULE_PATH[]  = WIFI_DRIVER_MODULE_PATH;
-static const char DRIVER_MODULE_ARG[]   = WIFI_DRIVER_MODULE_ARG;
+static const char DRIVER_MODULE_NAME[]      = WIFI_DRIVER_MODULE_NAME;
+static const char DRIVER_MODULE_TAG[]       = WIFI_DRIVER_MODULE_NAME " ";
+static const char DRIVER_MODULE_PATH[]      = WIFI_DRIVER_MODULE_PATH;
+static const char DRIVER_MODULE_ARG[]       = WIFI_DRIVER_MODULE_ARG;
+static const char DRIVER_P2P_MODULE_ARG[]   = WIFI_DRIVER_P2P_MODULE_ARG;
 #endif
 static const char FIRMWARE_LOADER[]     = WIFI_FIRMWARE_LOADER;
 static const char DRIVER_PROP_NAME[]    = "wlan.driver.status";
@@ -105,7 +114,7 @@ static const char P2P_PROP_NAME[]       = "init.svc.p2p_supplicant";
 static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf";
 static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
-static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
+static const char CONTROL_IFACE_PATH[]  = "/data/system/wpa_supplicant";
 static const char MODULE_FILE[]         = "/proc/modules";
 
 static const char SUPP_ENTROPY_FILE[]   = WIFI_ENTROPY_FILE;
@@ -234,6 +243,12 @@ int wifi_load_driver()
         return 0;
     }
 
+    if (insmod(DRIVER_COMPAT_MODULE_PATH, DRIVER_COMPAT_MODULE_ARG) < 0)
+        return -1;
+
+    if (insmod(DRIVER_SDIO_IF_MODULE_PATH, DRIVER_SDIO_IF_MODULE_ARG) < 0)
+        return -1;
+
     if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
         return -1;
 
@@ -265,24 +280,99 @@ int wifi_load_driver()
 #endif
 }
 
+int wifi_load_p2p_driver()
+{
+#ifdef WIFI_DRIVER_MODULE_PATH
+    char driver_status[PROPERTY_VALUE_MAX];
+    int count = 100; /* wait at most 20 seconds for completion */
+
+    if (is_wifi_driver_loaded()) {
+      return 0;
+    }
+
+    if (insmod(DRIVER_COMPAT_MODULE_PATH, DRIVER_COMPAT_MODULE_ARG) < 0)
+      return -1;
+
+    if (insmod(DRIVER_SDIO_IF_MODULE_PATH, DRIVER_SDIO_IF_MODULE_ARG) < 0)
+      return -1;
+
+    if (insmod(DRIVER_MODULE_PATH, DRIVER_P2P_MODULE_ARG) < 0)
+      return -1;
+
+    if (strcmp(FIRMWARE_LOADER,"") == 0) {
+      //usleep(1.5*WIFI_DRIVER_LOADER_DELAY);
+      property_set(DRIVER_PROP_NAME, "ok");
+    }
+    else {
+      property_set("ctl.start", FIRMWARE_LOADER);
+    }
+
+    sched_yield();
+
+    while (count-- > 0) {
+      if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
+	if (strcmp(driver_status, "ok") == 0) {
+	  return 0;
+	}
+	else if (strcmp(DRIVER_PROP_NAME, "failed") == 0) {
+	  wifi_unload_driver();
+	  return -1;
+	}
+      }
+      usleep(200000);
+    }
+
+    property_set(DRIVER_PROP_NAME, "timeout");
+    wifi_unload_driver();
+
+    return -1;
+#else
+    property_set(DRIVER_PROP_NAME, "ok");
+    return 0;
+#endif
+}
+
+static int _wifi_unload_driver()
+{
+  int count = 20; /* wait at most 10 seconds for completion */
+  char driver_status[PROPERTY_VALUE_MAX];
+  int s, ret;
+
+  if (rmmod(DRIVER_MODULE_NAME) == 0) {
+    while (count-- > 0) {
+      if (!is_wifi_driver_loaded())
+	break;
+      usleep(500000);
+    }
+
+    if (count) {
+      /* unload cfg80211 kernel module */
+      if (rmmod(DRIVER_SDIO_IF_MODULE_NAME) != 0) {
+	return -1;
+      }
+
+      /* unload compat kernel module */
+      if (rmmod(DRIVER_COMPAT_MODULE_NAME) != 0) {
+	return -1;
+      }
+
+    }
+    else {
+      return -1;
+    }
+
+    return 0;
+  }
+  else {
+    return -1;
+  }
+}
+
 int wifi_unload_driver()
 {
     usleep(200000); /* allow to finish interface down */
 #ifdef WIFI_DRIVER_MODULE_PATH
-    if (rmmod(DRIVER_MODULE_NAME) == 0) {
-        int count = 20; /* wait at most 10 seconds for completion */
-        while (count-- > 0) {
-            if (!is_wifi_driver_loaded())
-                break;
-            usleep(500000);
-        }
-        usleep(500000); /* allow card removal */
-        if (count) {
-            return 0;
-        }
-        return -1;
-    } else
-        return -1;
+    return _wifi_unload_driver();
 #else
     property_set(DRIVER_PROP_NAME, "unloaded");
     return 0;
@@ -342,6 +432,9 @@ int update_ctrl_interface(const char *config_file) {
     char *sptr;
     struct stat sb;
 
+    /* Return from here as same ctrl_iface is used in both p2p and wpa_supplicant conf files */
+    return 0;
+
     if (stat(config_file, &sb) != 0)
         return -1;
 
@@ -367,19 +460,7 @@ int update_ctrl_interface(const char *config_file) {
     } else {
         strcpy(ifc, CONTROL_IFACE_PATH);
     }
-    /*
-     * if there is a "ctrl_interface=<value>" entry, re-write it ONLY if it is
-     * NOT a directory.  The non-directory value option is an Android add-on
-     * that allows the control interface to be exchanged through an environment
-     * variable (initialized by the "init" program when it starts a service
-     * with a "socket" option).
-     *
-     * The <value> is deemed to be a directory if the "DIR=" form is used or
-     * the value begins with "/".
-     */
-    if ((sptr = strstr(pbuf, "ctrl_interface=")) &&
-        (!strstr(pbuf, "ctrl_interface=DIR=")) &&
-        (!strstr(pbuf, "ctrl_interface=/"))) {
+    if ((sptr = strstr(pbuf, "ctrl_interface="))) {
         char *iptr = sptr + strlen("ctrl_interface=");
         int ilen = 0;
         int mlen = strlen(ifc);
@@ -521,7 +602,7 @@ int wifi_start_supplicant(int p2p_supported)
     const prop_info *pi;
     unsigned serial = 0, i;
 #endif
-
+    ALOGE("wifi_start_supplicant p2p=%d\n",p2p_supported);
     if (p2p_supported) {
         strcpy(supplicant_name, P2P_SUPPLICANT_NAME);
         strcpy(supplicant_prop_name, P2P_PROP_NAME);
@@ -542,7 +623,7 @@ int wifi_start_supplicant(int p2p_supported)
             && strcmp(supp_status, "running") == 0) {
         return 0;
     }
-
+    ALOGE("Wi-Fi will ensure config file exist\n");
     /* Before starting the daemon, make sure its config file exists */
     if (ensure_config_file_exists(SUPP_CONFIG_FILE) < 0) {
         ALOGE("Wi-Fi will not be enabled");
@@ -575,10 +656,10 @@ int wifi_start_supplicant(int p2p_supported)
     }
 #endif
     property_get("wifi.interface", primary_iface, WIFI_TEST_INTERFACE);
-
+    ALOGE("start supplicant cmd=%s",supplicant_name);
     property_set("ctl.start", supplicant_name);
     sched_yield();
-
+    
     while (count-- > 0) {
 #ifdef HAVE_LIBC_SYSTEM_PROPERTIES
         if (pi == NULL) {
@@ -595,6 +676,7 @@ int wifi_start_supplicant(int p2p_supported)
         }
 #else
         if (property_get(supplicant_prop_name, supp_status, NULL)) {
+	  ALOGE("supp_status=%s\n",supp_status);
             if (strcmp(supp_status, "running") == 0)
                 return 0;
         }
@@ -736,14 +818,11 @@ int wifi_ctrl_recv(int index, char *reply, size_t *reply_len)
     }
     if (rfds[0].revents & POLLIN) {
         return wpa_ctrl_recv(monitor_conn[index], reply, reply_len);
-    } else if (rfds[1].revents & POLLIN) {
-        /* Close only the p2p sockets on receive side
-         * see wifi_close_supplicant_connection()
-         */
-        if (index == SECONDARY) {
-            ALOGD("close sockets %d", index);
-            wifi_close_sockets(index);
-        }
+    } else if (rfds[1].revents & POLLIN){
+	  if (index == SECONDARY) {
+		ALOGD("close sockets %d", index);
+        wifi_close_sockets(index);
+      }
     }
     return -2;
 }
@@ -895,6 +974,7 @@ int wifi_change_fw_path(const char *fwpath)
     int fd;
     int ret = 0;
 
+    return ret;
     if (!fwpath)
         return ret;
     fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_FW_PATH_PARAM, O_WRONLY));

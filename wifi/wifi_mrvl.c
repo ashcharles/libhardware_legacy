@@ -37,6 +37,10 @@
 #include <sys/_system_properties.h>
 #endif
 
+#ifdef MRVL_WIRELESS_DAEMON_API
+#include "marvell_wireless.h"
+#endif
+
 /* PRIMARY refers to the connection on the primary interface
  * SECONDARY refers to an optional connection on a p2p interface
  *
@@ -90,6 +94,13 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #define WIFI_DRIVER_LOADER_DELAY	1000000
 
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
+
+#ifdef WIFI_SDIO_IF_DRIVER_MODULE_PATH
+static const char DRIVER_SDIO_IF_MODULE_NAME[]  = WIFI_SDIO_IF_DRIVER_MODULE_NAME;
+static const char DRIVER_SDIO_IF_MODULE_PATH[]  = WIFI_SDIO_IF_DRIVER_MODULE_PATH;
+static const char DRIVER_SDIO_IF_MODULE_ARG[]   = WIFI_SDIO_IF_DRIVER_MODULE_ARG;
+#endif
+
 #ifdef WIFI_DRIVER_MODULE_PATH
 static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
 static const char DRIVER_MODULE_TAG[]   = WIFI_DRIVER_MODULE_NAME " ";
@@ -194,6 +205,7 @@ int is_wifi_driver_loaded() {
     char line[sizeof(DRIVER_MODULE_TAG)+10];
 #endif
 
+
     if (!property_get(DRIVER_PROP_NAME, driver_status, NULL)
             || strcmp(driver_status, "ok") != 0) {
         return 0;  /* driver not loaded */
@@ -226,14 +238,23 @@ int is_wifi_driver_loaded() {
 
 int wifi_load_driver()
 {
-#ifdef WIFI_DRIVER_MODULE_PATH
+#ifdef MRVL_WIRELESS_DAEMON_API
+	int ret = 0;
+	ret = wifi_enable();
+	if(ret)wifi_disable();
+	return ret;
+#elif defined(WIFI_DRIVER_MODULE_PATH)
     char driver_status[PROPERTY_VALUE_MAX];
     int count = 100; /* wait at most 20 seconds for completion */
 
     if (is_wifi_driver_loaded()) {
         return 0;
     }
-
+	
+	#ifdef WIFI_SDIO_IF_DRIVER_MODULE_PATH
+    insmod(DRIVER_SDIO_IF_MODULE_PATH, DRIVER_SDIO_IF_MODULE_ARG);
+	#endif
+	
     if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
         return -1;
 
@@ -245,6 +266,7 @@ int wifi_load_driver()
         property_set("ctl.start", FIRMWARE_LOADER);
     }
     sched_yield();
+
     while (count-- > 0) {
         if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
             if (strcmp(driver_status, "ok") == 0)
@@ -267,8 +289,13 @@ int wifi_load_driver()
 
 int wifi_unload_driver()
 {
+#ifdef MRVL_WIRELESS_DAEMON_API
+	return 0;
+//	return wifi_disable();
+#elif defined(MRVL_WIFI)
+	return 0;
+#elif defined(WIFI_DRIVER_MODULE_PATH)
     usleep(200000); /* allow to finish interface down */
-#ifdef WIFI_DRIVER_MODULE_PATH
     if (rmmod(DRIVER_MODULE_NAME) == 0) {
         int count = 20; /* wait at most 10 seconds for completion */
         while (count-- > 0) {
@@ -473,6 +500,30 @@ int ensure_config_file_exists(const char *config_file)
     }
     return update_ctrl_interface(config_file);
 }
+
+static void wifi_close_sockets(int index)
+{
+    if (ctrl_conn[index] != NULL) {
+        wpa_ctrl_close(ctrl_conn[index]);
+        ctrl_conn[index] = NULL;
+    }
+
+    if (monitor_conn[index] != NULL) {
+        wpa_ctrl_close(monitor_conn[index]);
+        monitor_conn[index] = NULL;
+    }
+
+    if (exit_sockets[index][0] >= 0) {
+        close(exit_sockets[index][0]);
+        exit_sockets[index][0] = -1;
+    }
+
+    if (exit_sockets[index][1] >= 0) {
+        close(exit_sockets[index][1]);
+        exit_sockets[index][1] = -1;
+    }
+}
+
 
 /**
  * wifi_wpa_ctrl_cleanup() - Delete any local UNIX domain socket files that
@@ -817,28 +868,6 @@ int wifi_wait_for_event(const char *ifname, char *buf, size_t buflen)
     }
 }
 
-void wifi_close_sockets(int index)
-{
-    if (ctrl_conn[index] != NULL) {
-        wpa_ctrl_close(ctrl_conn[index]);
-        ctrl_conn[index] = NULL;
-    }
-
-    if (monitor_conn[index] != NULL) {
-        wpa_ctrl_close(monitor_conn[index]);
-        monitor_conn[index] = NULL;
-    }
-
-    if (exit_sockets[index][0] >= 0) {
-        close(exit_sockets[index][0]);
-        exit_sockets[index][0] = -1;
-    }
-
-    if (exit_sockets[index][1] >= 0) {
-        close(exit_sockets[index][1]);
-        exit_sockets[index][1] = -1;
-    }
-}
 
 void wifi_close_supplicant_connection(const char *ifname)
 {
@@ -894,7 +923,6 @@ int wifi_change_fw_path(const char *fwpath)
     int len;
     int fd;
     int ret = 0;
-
     if (!fwpath)
         return ret;
     fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_FW_PATH_PARAM, O_WRONLY));

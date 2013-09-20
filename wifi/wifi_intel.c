@@ -1,5 +1,6 @@
 /*
  * Copyright 2008, The Android Open Source Project
+ * Copyright (C) 2013 Freescale Semiconductor, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,12 +89,12 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #endif
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
+#define SYSFS_PATH_MAX			256
 
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
 #ifdef WIFI_DRIVER_MODULE_PATH
-static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
-static const char DRIVER_MODULE_TAG[]   = WIFI_DRIVER_MODULE_NAME " ";
-static const char DRIVER_MODULE_PATH[]  = WIFI_DRIVER_MODULE_PATH;
+static const char DRIVER_NAME_PROP[]    = "wlan.modname";
+static const char DRIVER_PATH_PROP[]    = "wlan.modpath";
 static const char DRIVER_MODULE_ARG[]   = WIFI_DRIVER_MODULE_ARG;
 #endif
 static const char FIRMWARE_LOADER[]     = WIFI_FIRMWARE_LOADER;
@@ -107,6 +108,9 @@ static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
 static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
 static const char MODULE_FILE[]         = "/proc/modules";
+static const char SYSFS_CLASS_NET[]     = "/sys/class/net";
+static const char MODULE_DEFAULT_DIR[]  = "/system/lib/modules";
+static const char SYS_MOD_NAME_DIR[]    = "device/driver/module";
 
 static const char SUPP_ENTROPY_FILE[]   = WIFI_ENTROPY_FILE;
 static unsigned char dummy_key[21] = { 0x02, 0x11, 0xbe, 0x33, 0x43, 0x35,
@@ -187,18 +191,91 @@ const char *get_dhcp_error_string() {
     return dhcp_lasterror();
 }
 
-int is_wifi_driver_loaded() {
-    char driver_status[PROPERTY_VALUE_MAX];
 #ifdef WIFI_DRIVER_MODULE_PATH
-    FILE *proc;
-    char line[sizeof(DRIVER_MODULE_TAG)+10];
+static int get_driver_path(const char *mod, const char *path, char *buf) {
+    DIR *dir;
+    struct dirent *de;
+    char modpath[SYSFS_PATH_MAX];
+    int ret = 0;
+
+    if ((dir = opendir(path))) {
+        while ((de = readdir(dir))) {
+            struct stat sb;
+            if (de->d_name[0] == '.')
+                continue;
+            snprintf(modpath, SYSFS_PATH_MAX, "%s/%s", path, de->d_name);
+            if (!strcmp(de->d_name, mod)) {
+                strncpy(buf, modpath, SYSFS_PATH_MAX - 1);
+                buf[SYSFS_PATH_MAX - 1] = '\0';
+                ret = 1;
+                break;
+            }
+            if (!stat(modpath, &sb) && (sb.st_mode & S_IFMT) == S_IFDIR)
+                if ((ret = get_driver_path(mod, modpath, buf)))
+                    break;
+        }
+        closedir(dir);
+    }
+    return ret;
+}
+
+static int get_driver_info(char *buf) {
+    DIR *netdir;
+    struct dirent *de;
+    char path[SYSFS_PATH_MAX];
+    char link[SYSFS_PATH_MAX];
+    int ret = 0;
+
+    if ((netdir = opendir(SYSFS_CLASS_NET))) {
+        while ((de = readdir(netdir))) {
+            int cnt;
+            char *pos;
+            if (de->d_name[0] == '.')
+                continue;
+            snprintf(path, SYSFS_PATH_MAX, "%s/%s/wireless", SYSFS_CLASS_NET, de->d_name);
+            if (access(path, F_OK)) {
+                snprintf(path, SYSFS_PATH_MAX, "%s/%s/phy80211", SYSFS_CLASS_NET, de->d_name);
+                if (access(path, F_OK))
+                    continue;
+            }
+            /* found the wifi interface */
+            property_set("wlan.interface", de->d_name);
+            snprintf(path, SYSFS_PATH_MAX, "%s/%s/%s", SYSFS_CLASS_NET, de->d_name, SYS_MOD_NAME_DIR);
+            if ((cnt = readlink(path, link, SYSFS_PATH_MAX - 1)) < 0) {
+                ALOGW("can not find link of %s", path);
+                continue;
+            }
+            link[cnt] = '\0';
+            if ((pos = strrchr(link, '/'))) {
+                property_set(DRIVER_NAME_PROP, ++pos);
+                strncpy(buf, pos, PROPERTY_VALUE_MAX - 1);
+                buf[PROPERTY_VALUE_MAX - 1] = '\0';
+                ret = 1;
+                break;
+            }
+        }
+        closedir(netdir);
+    }
+
+    return ret;
+}
 #endif
 
-    if (!property_get(DRIVER_PROP_NAME, driver_status, NULL)
-            || strcmp(driver_status, "ok") != 0) {
-        return 0;  /* driver not loaded */
-    }
+int is_wifi_driver_loaded() {
 #ifdef WIFI_DRIVER_MODULE_PATH
+    char modname[PROPERTY_VALUE_MAX];
+    char line[PROPERTY_VALUE_MAX];
+    FILE *proc;
+    int cnt = property_get(DRIVER_NAME_PROP, modname, NULL);
+
+    if (!cnt) {
+        if (get_driver_info(modname))
+            cnt = strlen(modname);
+        else
+            goto unloaded;
+    }
+    modname[cnt++] = ' ';
+
     /*
      * If the property says the driver is loaded, check to
      * make sure that the property setting isn't just left
@@ -207,16 +284,18 @@ int is_wifi_driver_loaded() {
      */
     if ((proc = fopen(MODULE_FILE, "r")) == NULL) {
         ALOGW("Could not open %s: %s", MODULE_FILE, strerror(errno));
-        property_set(DRIVER_PROP_NAME, "unloaded");
-        return 0;
+        goto unloaded;
     }
+
     while ((fgets(line, sizeof(line), proc)) != NULL) {
-        if (strncmp(line, DRIVER_MODULE_TAG, strlen(DRIVER_MODULE_TAG)) == 0) {
+        if (strncmp(line, modname, cnt) == 0) {
             fclose(proc);
             return 1;
         }
     }
     fclose(proc);
+
+unloaded:
     property_set(DRIVER_PROP_NAME, "unloaded");
     return 0;
 #else
@@ -228,13 +307,23 @@ int wifi_load_driver()
 {
 #ifdef WIFI_DRIVER_MODULE_PATH
     char driver_status[PROPERTY_VALUE_MAX];
+    char modname[PROPERTY_VALUE_MAX];
+    char modpath[SYSFS_PATH_MAX];
     int count = 100; /* wait at most 20 seconds for completion */
 
     if (is_wifi_driver_loaded()) {
         return 0;
     }
 
-    if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
+    if (!property_get(DRIVER_PATH_PROP, modpath, NULL)) {
+        property_get(DRIVER_NAME_PROP, modname, NULL);
+        strcat(modname, ".ko");
+        if (!get_driver_path(modname, MODULE_DEFAULT_DIR, modpath))
+            strcpy(modpath, WIFI_DRIVER_MODULE_PATH);
+    }
+
+    ALOGW("got module patch %s", modpath);
+    if (insmod(modpath, DRIVER_MODULE_ARG) < 0)
         return -1;
 
     if (strcmp(FIRMWARE_LOADER,"") == 0) {
@@ -247,9 +336,10 @@ int wifi_load_driver()
     sched_yield();
     while (count-- > 0) {
         if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
-            if (strcmp(driver_status, "ok") == 0)
+            if (strcmp(driver_status, "ok") == 0) {
+                get_driver_info(modname);
                 return 0;
-            else if (strcmp(DRIVER_PROP_NAME, "failed") == 0) {
+            } else if (strcmp(DRIVER_PROP_NAME, "failed") == 0) {
                 wifi_unload_driver();
                 return -1;
             }
@@ -269,7 +359,11 @@ int wifi_unload_driver()
 {
     usleep(200000); /* allow to finish interface down */
 #ifdef WIFI_DRIVER_MODULE_PATH
-    if (rmmod(DRIVER_MODULE_NAME) == 0) {
+    char modname[PROPERTY_VALUE_MAX];
+    if (!property_get(DRIVER_NAME_PROP, modname, NULL))
+        return -1;
+
+    if (rmmod(modname) == 0) {
         int count = 20; /* wait at most 10 seconds for completion */
         while (count-- > 0) {
             if (!is_wifi_driver_loaded())
@@ -280,9 +374,8 @@ int wifi_unload_driver()
         if (count) {
             return 0;
         }
-        return -1;
-    } else
-        return -1;
+    }
+    return -1;
 #else
     property_set(DRIVER_PROP_NAME, "unloaded");
     return 0;
@@ -363,7 +456,7 @@ int update_ctrl_interface(const char *config_file) {
     }
 
     if (!strcmp(config_file, SUPP_CONFIG_FILE)) {
-        property_get("wifi.interface", ifc, WIFI_TEST_INTERFACE);
+        property_get("wlan.interface", ifc, WIFI_TEST_INTERFACE);
     } else {
         strcpy(ifc, CONTROL_IFACE_PATH);
     }
@@ -515,6 +608,7 @@ void wifi_wpa_ctrl_cleanup(void)
 
 int wifi_start_supplicant(int p2p_supported)
 {
+    char daemon_cmd[PROPERTY_VALUE_MAX];
     char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
     int count = 200; /* wait at most 20 seconds for completion */
 #ifdef HAVE_LIBC_SYSTEM_PROPERTIES
@@ -574,9 +668,9 @@ int wifi_start_supplicant(int p2p_supported)
         serial = pi->serial;
     }
 #endif
-    property_get("wifi.interface", primary_iface, WIFI_TEST_INTERFACE);
-
-    property_set("ctl.start", supplicant_name);
+    property_get("wlan.interface", primary_iface, WIFI_TEST_INTERFACE);
+    snprintf(daemon_cmd, PROPERTY_VALUE_MAX, "%s:-i%s", supplicant_name, primary_iface);
+    property_set("ctl.start", daemon_cmd);
     sched_yield();
 
     while (count-- > 0) {
